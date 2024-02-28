@@ -9,8 +9,8 @@ lazy val root = (project in file("."))
   .settings(
     name := "otoroshi-plugin-couchbase",
     resolvers += "jitpack" at "https://jitpack.io",
-    test in assembly := {},
-    assemblyJarName in assembly := "otoroshi-plugin-couchbase-assembly_2.12-dev.jar",
+    assembly / test  := {},
+    assembly / assemblyJarName := "otoroshi-plugin-couchbase-assembly_2.12-dev.jar",
     libraryDependencies ++= Seq(
       "fr.maif" %% "otoroshi" % "16.14.0" % "provided",
       "com.couchbase.client" %% "scala-client" % "1.5.1",
