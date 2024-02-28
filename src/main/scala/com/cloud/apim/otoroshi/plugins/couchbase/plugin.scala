@@ -440,7 +440,7 @@ class CouchbaseRedisLikeBuilder(caLogger: Logger) extends GenericRedisLikeBuilde
   }
 }
 
-class CouchbaseDataStores(
+class InternalCouchbaseDataStores(
   configuration: Configuration,
   environment: Environment,
   lifecycle: ApplicationLifecycle,
@@ -462,10 +462,10 @@ class CouchbaseDataStores(
 
 }
 
-class CouchbaseDataStoresBuilder extends DataStoresBuilder {
+class CouchbaseDataStores extends DataStoresBuilder {
   private val logger = Logger("cloud-apim-couchbase-datastore")
   override def build(configuration: Configuration, environment: Environment, lifecycle: ApplicationLifecycle, clusterMode: ClusterMode, env: Env): DataStores = {
-    new CouchbaseDataStores(
+    new InternalCouchbaseDataStores(
       configuration,
       environment,
       lifecycle,
