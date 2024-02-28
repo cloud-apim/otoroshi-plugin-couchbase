@@ -60,7 +60,7 @@ class CouchbaseRedisLike(env: Env, logger: Logger, actorSystem: ActorSystem) ext
   val schemaDotTable = s"`${bucketName}`.${scope}.${collectionName}"
 
   val cluster = rawCluster.async
-  
+
   val bucket = cluster.bucket(bucketName)
   Await.result(bucket.waitUntilReady(30.seconds), 31.seconds)
 
@@ -432,7 +432,11 @@ class CouchbaseRedisLikeBuilder(caLogger: Logger) extends GenericRedisLikeBuilde
     logger: Logger,
     env: Env
   ): GenericRedisLike = {
-    new CouchbaseRedisLike(env, caLogger, actorSystem)
+    val redis = new CouchbaseRedisLike(env, caLogger, actorSystem)
+    lifecycle.addStopHook { () =>
+      redis.cluster.disconnect()
+    }
+    redis
   }
 }
 
