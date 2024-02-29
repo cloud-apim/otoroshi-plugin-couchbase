@@ -458,7 +458,7 @@ class InternalCouchbaseDataStores(
   env
 ) {
 
-  caLogger.info(s"Now using Couchbase DataStores")
+  caLogger.info(s"[Cloud APIM] Now using Couchbase DataStores")
 
 }
 
