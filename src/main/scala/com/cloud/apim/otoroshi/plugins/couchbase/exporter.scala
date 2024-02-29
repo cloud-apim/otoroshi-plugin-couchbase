@@ -112,7 +112,7 @@ class CouchbaseDataExporter extends CustomDataExporter {
 
   private val ref = new AtomicReference[InternalCouchbaseDataExporter]()
 
-  override def categories: Seq[NgPluginCategory] = Seq.empty
+  override def categories: Seq[NgPluginCategory] = Seq(NgPluginCategory.Custom("Cloud APIM"))
   override def steps: Seq[NgStep]                = Seq.empty
   override def visibility: NgPluginVisibility    = NgPluginVisibility.NgUserLand
   override def core: Boolean                     = false
