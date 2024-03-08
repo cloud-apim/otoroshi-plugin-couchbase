@@ -278,6 +278,7 @@ class CouchbaseRedisLike(env: Env, logger: Logger, actorSystem: ActorSystem) ext
       .recover {
         case e => logger.error("error while check insertion", e)
       }
+      .map(_ => ())
       .andThen {
         case _ => {
           val elapsed = System.currentTimeMillis() - start
