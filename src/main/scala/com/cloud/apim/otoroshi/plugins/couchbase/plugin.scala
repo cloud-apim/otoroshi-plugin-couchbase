@@ -2,6 +2,7 @@ package otoroshi_plugins.com.cloud.apim.plugins.couchbase
 
 import akka.actor.{ActorSystem, Cancellable}
 import akka.stream.Materializer
+import akka.stream.scaladsl.Source
 import akka.util.ByteString
 import com.couchbase.client.core.diagnostics.ClusterState
 import com.couchbase.client.scala._
@@ -20,7 +21,7 @@ import storage.drivers.generic.{GenericDataStores, GenericRedisLike, GenericRedi
 import java.util
 import java.util.concurrent.atomic.AtomicReference
 import scala.collection.concurrent.TrieMap
-import scala.concurrent.duration.{DurationInt, DurationLong}
+import scala.concurrent.duration.{DurationInt, DurationLong, FiniteDuration}
 import scala.concurrent.{Await, ExecutionContext, Future}
 import scala.jdk.CollectionConverters.seqAsJavaListConverter
 import scala.util.{Failure, Success}
@@ -37,6 +38,7 @@ class CouchbaseRedisLike(env: Env, logger: Logger, actorSystem: ActorSystem) ext
   val collectionName = env.configuration.getOptionalWithFileSupport[String]("otoroshi.couchbase.collection").getOrElse("entities")
   val tls = env.configuration.getOptionalWithFileSupport[Boolean]("otoroshi.couchbase.tls").getOrElse(false)
   val wanProfile = env.configuration.getOptionalWithFileSupport[Boolean]("otoroshi.couchbase.wan-profile").getOrElse(true)
+  val insertAndExistsTimeout = env.configuration.getOptionalWithFileSupport[Long]("otoroshi.couchbase.exists-timeout").map(_.milliseconds).getOrElse(10.seconds)
 
   val couchbaseEnv = ClusterEnvironment.builder
     // TODO: add more config
@@ -261,10 +263,34 @@ class CouchbaseRedisLike(env: Env, logger: Logger, actorSystem: ActorSystem) ext
     hsetBS(key, field, value.byteString)
   }
 
+  private def insertAndExists(key: String, doc: JsonObject, timeout: FiniteDuration): Future[Unit] = {
+    implicit val ec = env.otoroshiExecutionContext
+    implicit val mat = env.otoroshiMaterializer
+    val start = System.currentTimeMillis()
+    Source
+      .tick(0.milliseconds, 50.milliseconds, ())
+      .mapAsync(1) { _ =>
+        collection.exists(key)
+      }
+      .takeWhile(!_.exists)
+      .completionTimeout(timeout)
+      .run()
+      .recover {
+        case e => logger.error("error while check insertion", e)
+      }
+      .andThen {
+        case _ => {
+          val elapsed = System.currentTimeMillis() - start
+          if (elapsed > 500) {
+            logger.warn(s"insert and check for '${key}' took ${elapsed} ms.")
+          }
+        }
+      }
+  }
+
   override def hsetBS(key: String, field: String, value: ByteString): Future[Boolean] = measure("couchbase.ops.hset") {
-    // TODO: ensure doc has been written ???
     for {
-      _ <- innerInsert(key, createDoc(key, "hash"))
+      _ <- insertAndExists(key, createDoc(key, "hash"), insertAndExistsTimeout)
       _ <- collection.mutateIn(key, Seq(
         MutateInSpec.upsert(s"hvalue.${field}", value.utf8String)
       ))
@@ -293,9 +319,8 @@ class CouchbaseRedisLike(env: Env, logger: Logger, actorSystem: ActorSystem) ext
   }
 
   override def lpushBS(key: String, values: ByteString*): Future[Long] = measure("couchbase.ops.lpush") {
-    // TODO: ensure doc has been written ???
     for {
-      _ <- innerInsert(key, createDoc(key, "list"))
+      _ <- insertAndExists(key, createDoc(key, "list"), insertAndExistsTimeout)
       _ <- collection.mutateIn(key, Seq(
         MutateInSpec.arrayPrepend(s"lvalue", values.map(_.utf8String))
       ))
@@ -317,9 +342,8 @@ class CouchbaseRedisLike(env: Env, logger: Logger, actorSystem: ActorSystem) ext
   }
 
   override def ltrim(key: String, start: Long, stop: Long): Future[Boolean] = measure("couchbase.ops.ltrim") {
-    // TODO: ensure doc has been written ???
     for {
-      _ <- innerInsert(key, createDoc(key, "list"))
+      _ <- insertAndExists(key, createDoc(key, "list"), insertAndExistsTimeout)
       all <- lrange(key, 0, 10000L) // lol
       newAll = all.map(_.utf8String).slice(start.toInt, stop.toInt - start.toInt)
       _ <- collection.mutateIn(key, Seq(
@@ -373,9 +397,8 @@ class CouchbaseRedisLike(env: Env, logger: Logger, actorSystem: ActorSystem) ext
   }
 
   override def saddBS(key: String, members: ByteString*): Future[Long] = measure("couchbase.ops.sadd") {
-    // TODO: ensure doc has been written ???
     for {
-      _ <- innerInsert(key, createDoc(key, "set"))
+      _ <- insertAndExists(key, createDoc(key, "set"), insertAndExistsTimeout)
       _ <- collection.mutateIn(key, members.map(_.utf8String).map { member =>
         MutateInSpec.arrayAddUnique(s"lvalue", member)
       })
