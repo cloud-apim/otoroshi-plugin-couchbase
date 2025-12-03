@@ -12,7 +12,7 @@ lazy val root = (project in file("."))
     assembly / test  := {},
     assembly / assemblyJarName := "otoroshi-plugin-couchbase-assembly_2.12-dev.jar",
     libraryDependencies ++= Seq(
-      "fr.maif" %% "otoroshi" % "17.9.1" % "provided",
+      "fr.maif" %% "otoroshi" % "17.9.2" % "provided",
       "com.couchbase.client" %% "scala-client" % "1.5.1",
       munit % Test
     )
