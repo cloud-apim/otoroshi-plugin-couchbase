@@ -1,21 +1,23 @@
 package otoroshi_plugins.com.cloud.apim.plugins.couchbase
 
-import akka.stream.scaladsl.{Sink, Source}
 import com.couchbase.client.scala.{AsyncCluster, AsyncCollection, Cluster, ClusterOptions}
 import com.couchbase.client.scala.env.{ClusterEnvironment, SecurityConfig}
+import com.couchbase.client.scala.json.JsonObject
+import org.apache.pekko.stream.Materializer
+import org.apache.pekko.stream.scaladsl.{Sink, Source}
 import otoroshi.env.Env
 import otoroshi.events.DataExporter.DefaultDataExporter
 import otoroshi.events.{CustomDataExporter, CustomDataExporterContext, ExportResult}
 import otoroshi.models.DataExporterConfig
 import otoroshi.next.plugins.api.{NgPluginCategory, NgPluginVisibility, NgStep}
-import otoroshi.utils.syntax.implicits._
+import otoroshi.utils.syntax.implicits.*
 import play.api.libs.json.JsValue
 
 import java.util.concurrent.atomic.AtomicReference
 import scala.concurrent.duration.DurationInt
 import scala.concurrent.{Await, ExecutionContext, Future}
 
-class InternalCouchbaseDataExporter(config: DataExporterConfig, internalConfig: JsValue)(implicit ec: ExecutionContext, env: Env) extends DefaultDataExporter(config)(ec, env) {
+class InternalCouchbaseDataExporter(config: DataExporterConfig, internalConfig: JsValue)(using ec: ExecutionContext, env: Env) extends DefaultDataExporter(config)(using ec, env) {
 
   private val clusterRef = new AtomicReference[AsyncCluster]()
   private val collectionRef = new AtomicReference[AsyncCollection]()
@@ -29,14 +31,16 @@ class InternalCouchbaseDataExporter(config: DataExporterConfig, internalConfig: 
   }
 
   override def send(events: Seq[JsValue]): Future[ExportResult] = {
-    implicit val ec = env.analyticsExecutionContext
-    implicit val mat = env.analyticsMaterializer
+    given ec: ExecutionContext = env.analyticsExecutionContext
+    given mat: Materializer = env.analyticsMaterializer
     val workers = internalConfig.select("workers").asOpt[Int].getOrElse(4)
     Source(events.toList)
       .mapAsync(workers) { event =>
         val id = event.select("@id").asString
         withCollection { collection =>
-          collection.insert(id, event)
+          // the scala 3 build of the couchbase sdk does not ship the play-json codecs anymore,
+          // so the event is handed over as a couchbase json document
+          collection.insert(id, JsonObject.fromJson(event.stringify))
             .map(_ => Right(()))
             .recover {
               case e =>
@@ -94,7 +98,9 @@ class InternalCouchbaseDataExporter(config: DataExporterConfig, internalConfig: 
     val cluster = rawCluster.async
 
     val bucket = cluster.bucket(bucketName)
-    Await.result(bucket.waitUntilReady(5.seconds), 6.seconds)
+    // since sdk 3.9, `waitUntilReady` only lives on the cluster. it covers every bucket
+    // opened so far, so opening the bucket first keeps the previous semantics
+    Await.result(cluster.waitUntilReady(5.seconds), 6.seconds)
 
     val collection = bucket.scope(scope).collection(collectionName)
 
@@ -120,25 +126,25 @@ class CouchbaseDataExporter extends CustomDataExporter {
   override def name: String                                = "Couchbase"
   override def description: Option[String]                 = "This exporter send otoroshi event in the Couchbase bucket of your choice".some
 
-  override def accept(event: JsValue, ctx: CustomDataExporterContext)(implicit env: Env): Boolean = {
+  override def accept(event: JsValue, ctx: CustomDataExporterContext)(using env: Env): Boolean = {
     ref.get().accept(event)
   }
 
-  override def project(event: JsValue, ctx: CustomDataExporterContext)(implicit env: Env): JsValue = {
+  override def project(event: JsValue, ctx: CustomDataExporterContext)(using env: Env): JsValue = {
     ref.get().project(event)
   }
 
-  override def send(events: Seq[JsValue], ctx: CustomDataExporterContext)(implicit ec: ExecutionContext, env: Env): Future[ExportResult] = {
+  override def send(events: Seq[JsValue], ctx: CustomDataExporterContext)(using ec: ExecutionContext, env: Env): Future[ExportResult] = {
     ref.get().send(events)
   }
 
-  override def startExporter(ctx: CustomDataExporterContext)(implicit ec: ExecutionContext, env: Env): Future[Unit] = {
-    ref.set(new InternalCouchbaseDataExporter(ctx.exporter.configUnsafe, ctx.config)(ec, env))
+  override def startExporter(ctx: CustomDataExporterContext)(using ec: ExecutionContext, env: Env): Future[Unit] = {
+    ref.set(new InternalCouchbaseDataExporter(ctx.exporter.configUnsafe, ctx.config)(using ec, env))
     ref.get().onStart()
     ().vfuture
   }
 
-  override def stopExporter(ctx: CustomDataExporterContext)(implicit ec: ExecutionContext, env: Env): Future[Unit] = {
+  override def stopExporter(ctx: CustomDataExporterContext)(using ec: ExecutionContext, env: Env): Future[Unit] = {
     ref.get().onStop()
     ().vfuture
   }

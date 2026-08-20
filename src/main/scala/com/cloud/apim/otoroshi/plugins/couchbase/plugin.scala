@@ -1,14 +1,14 @@
 package otoroshi_plugins.com.cloud.apim.plugins.couchbase
 
-import akka.actor.{ActorSystem, Cancellable}
-import akka.stream.Materializer
-import akka.stream.scaladsl.Source
-import akka.util.ByteString
 import com.couchbase.client.core.diagnostics.ClusterState
-import com.couchbase.client.scala._
-import com.couchbase.client.scala.env._
+import com.couchbase.client.scala.*
+import com.couchbase.client.scala.env.*
 import com.couchbase.client.scala.json.{JsonArray, JsonObject, JsonObjectSafe}
 import com.couchbase.client.scala.kv.{GetResult, MutateInOptions, MutateInSpec}
+import org.apache.pekko.actor.{ActorSystem, Cancellable}
+import org.apache.pekko.stream.Materializer
+import org.apache.pekko.stream.scaladsl.{Sink, Source}
+import org.apache.pekko.util.ByteString
 import otoroshi.cluster.ClusterMode
 import otoroshi.env.Env
 import otoroshi.storage.{DataStoreHealth, DataStores, DataStoresBuilder}
@@ -18,17 +18,16 @@ import play.api.inject.ApplicationLifecycle
 import play.api.{Configuration, Environment, Logger}
 import storage.drivers.generic.{GenericDataStores, GenericRedisLike, GenericRedisLikeBuilder}
 
-import java.util
 import java.util.concurrent.atomic.AtomicReference
 import scala.collection.concurrent.TrieMap
+import scala.collection.mutable.{HashSet, ListBuffer}
 import scala.concurrent.duration.{DurationInt, DurationLong, FiniteDuration}
 import scala.concurrent.{Await, ExecutionContext, Future}
-import scala.jdk.CollectionConverters.seqAsJavaListConverter
 import scala.util.{Failure, Success}
 
 class CouchbaseRedisLike(env: Env, logger: Logger, actorSystem: ActorSystem) extends GenericRedisLike {
 
-  import actorSystem.dispatcher
+  private given ec: ExecutionContext = actorSystem.dispatcher
 
   val endpoint = env.configuration.getOptionalWithFileSupport[String]("otoroshi.couchbase.endpoint").getOrElse("127.0.0.1")
   val username = env.configuration.getOptionalWithFileSupport[String]("otoroshi.couchbase.username").getOrElse("admin")
@@ -64,14 +63,16 @@ class CouchbaseRedisLike(env: Env, logger: Logger, actorSystem: ActorSystem) ext
   val cluster = rawCluster.async
 
   val bucket = cluster.bucket(bucketName)
-  Await.result(bucket.waitUntilReady(30.seconds), 31.seconds)
+  // since sdk 3.9, `waitUntilReady` only lives on the cluster. it covers every bucket
+  // opened so far, so opening the bucket first keeps the previous semantics
+  Await.result(cluster.waitUntilReady(30.seconds), 31.seconds)
 
   // TODO: create bucket, scope and collection if ok with user
-  Await.result(cluster.query(s"CREATE INDEX idx_key ON ${schemaDotTable}(`key`);").recover {
-    case e => logger.info("primary index already exists")
+  Await.result(cluster.query(s"CREATE INDEX idx_key ON ${schemaDotTable}(`key`);").map(_ => ()).recover {
+    case _ => logger.info("primary index already exists")
   }, 30.seconds)
-  Await.result(cluster.query(s"CREATE INDEX idx_key ON ${schemaDotTable}(`expired_at`);").recover {
-    case e => logger.info("expired_at index already exists")
+  Await.result(cluster.query(s"CREATE INDEX idx_key ON ${schemaDotTable}(`expired_at`);").map(_ => ()).recover {
+    case _ => logger.info("expired_at index already exists")
   }, 30.seconds)
 
   val collection = bucket.scope(scope).collection(collectionName)
@@ -79,8 +80,8 @@ class CouchbaseRedisLike(env: Env, logger: Logger, actorSystem: ActorSystem) ext
   private val cancel = new AtomicReference[Cancellable]()
 
   def setupCleanup(): Unit = {
-    implicit val ec = env.otoroshiExecutionContext
-    cancel.set(env.otoroshiScheduler.scheduleAtFixedRate(10.seconds, 40.second)(SchedulerHelper.runnable {
+    given ec: ExecutionContext = env.otoroshiExecutionContext
+    cancel.set(env.otoroshiScheduler.scheduleAtFixedRate(10.seconds, 40.seconds)(SchedulerHelper.runnable {
       cluster.query(s"DELETE FROM $schemaDotTable WHERE expired_at < ${System.currentTimeMillis()};").andThen {
         case Failure(exception) => exception.printStackTrace()
       }
@@ -94,23 +95,14 @@ class CouchbaseRedisLike(env: Env, logger: Logger, actorSystem: ActorSystem) ext
     env.metrics.withTimerAsync(what)(fut)
   }
 
-  private def arrayList[A](seq: Seq[A]): java.util.ArrayList[A] = {
-    val list: java.util.List[A] = seq.asJava
-    val alist = new util.ArrayList[A]()
-    alist.addAll(list)
-    alist
-  }
-
   private def innerGet[A](key: String)(f: GetResult => Option[A]): Future[Option[A]] = {
-    collection.get(key).map { res =>
-      f(res)
-    }.recover {
-      case e => None
+    collection.get(key).map(f).recover {
+      case _ => None
     }
   }
 
   private def innerInsert(key: String, value: JsonObject): Future[Unit] = {
-    collection.insert(key, value).map(_ => ()).recover { case e => () }
+    collection.insert(key, value).map(_ => ()).recover { case _ => () }
   }
 
   private def createDoc(key: String, typ: String): JsonObject = {
@@ -134,9 +126,9 @@ class CouchbaseRedisLike(env: Env, logger: Logger, actorSystem: ActorSystem) ext
         doc.str("type") match {
           case Success("counter") => doc.numLong("counter").getOrElse(0L).some
           case Success("string") => doc.str("value").toOption
-          case Success("hash") => doc.obj("hvalue").toOption.map(obj => new TrieMap[String, ByteString]() ++ obj.toMap.mapValues(_.asInstanceOf[String].byteString))
-          case Success("list") => doc.arr("lvalue").toOption.map(obj => new scala.collection.mutable.MutableList[ByteString]() ++ obj.toSeq.map(_.asInstanceOf[String].byteString))
-          case Success("set") => doc.arr("lsvalue").toOption.map(obj => new scala.collection.mutable.HashSet[ByteString]() ++ obj.toSeq.map(_.asInstanceOf[String].byteString))
+          case Success("hash") => doc.obj("hvalue").toOption.map(obj => TrieMap.empty[String, ByteString] ++ obj.toMap.view.mapValues(_.asInstanceOf[String].byteString))
+          case Success("list") => doc.arr("lvalue").toOption.map(arr => ListBuffer.empty[ByteString] ++ arr.toSeq.map(_.asInstanceOf[String].byteString))
+          case Success("set") => doc.arr("svalue").toOption.map(arr => HashSet.empty[ByteString] ++ arr.toSeq.map(_.asInstanceOf[String].byteString))
           case _ => None
         }
       }
@@ -157,25 +149,25 @@ class CouchbaseRedisLike(env: Env, logger: Logger, actorSystem: ActorSystem) ext
     }.map(_.getOrElse("none"))
   }
 
-  override def health()(implicit ec: ExecutionContext): Future[DataStoreHealth] = measure("couchbase.ops.health") {
+  override def health()(using ec: ExecutionContext): Future[DataStoreHealth] = measure("couchbase.ops.health") {
     cluster.diagnostics().map { diag =>
       diag.state() match {
         case ClusterState.ONLINE => otoroshi.storage.Healthy
         case ClusterState.DEGRADED => otoroshi.storage.Unhealthy
-        case ClusterState.OFFLINE => otoroshi.storage.Unreachable
+        case _ => otoroshi.storage.Unreachable
       }
     }.recover {
-      case e => otoroshi.storage.Unreachable
+      case _ => otoroshi.storage.Unreachable
     }
   }
 
   override def stop(): Unit = ()
 
-  override def get(key: String): Future[Option[ByteString]] = measure(s"couchbase.ops.get") {
+  override def get(key: String): Future[Option[ByteString]] = measure("couchbase.ops.get") {
     innerGet(key) { res =>
       res.contentAs[JsonObject].toOption.flatMap { doc =>
         doc.get("value") match {
-          case obj: JsonObject => obj.toString().byteString.some
+          case obj: JsonObject => obj.toString.byteString.some
           case str: String => ByteString(str).some
           case _ => None
         }
@@ -188,7 +180,7 @@ class CouchbaseRedisLike(env: Env, logger: Logger, actorSystem: ActorSystem) ext
     cluster.query(
       s"select `key`, `value`, `counter`, `type` from $schemaDotTable where `key` in [$inValues];"
     ).map { result =>
-      result.rowsAs[JsonObjectSafe].getOrElse(Seq.empty).flatMap(_.str("value").toOption).map(_.byteString.some)
+      result.rowsAs[JsonObjectSafe].map(_.toSeq).getOrElse(Seq.empty).flatMap(_.str("value").toOption).map(_.byteString.some)
     }
   }
 
@@ -196,7 +188,7 @@ class CouchbaseRedisLike(env: Env, logger: Logger, actorSystem: ActorSystem) ext
     setBS(key, ByteString(value), exSeconds, pxMilliseconds)
   }
 
-  override def setBS(key: String, value: ByteString, exSeconds: Option[Long], pxMilliseconds: Option[Long]): Future[Boolean] = measure(s"couchbase.ops.set") {
+  override def setBS(key: String, value: ByteString, exSeconds: Option[Long], pxMilliseconds: Option[Long]): Future[Boolean] = measure("couchbase.ops.set") {
     val ttl = exSeconds.map(_ * 1000).orElse(pxMilliseconds)
     val valueStr = value.utf8String
     val jsonValue = if (valueStr.startsWith("{")) {
@@ -204,13 +196,11 @@ class CouchbaseRedisLike(env: Env, logger: Logger, actorSystem: ActorSystem) ext
     } else {
       valueStr
     }
-    collection.upsert(key, createDoc(key, "string").put("value", jsonValue).put("ttl", ttl.orNull)).map { res =>
-      true
-    }
+    collection.upsert(key, createDoc(key, "string").put("value", jsonValue).put("ttl", ttl.orNull)).map(_ => true)
   }
 
   override def del(keys: String*): Future[Long] = measure("couchbase.ops.del") {
-    Future.sequence(keys.map(k => collection.remove(k))).map(_ => keys.size)
+    Future.sequence(keys.map(k => collection.remove(k))).map(_ => keys.size.toLong)
   }
 
   override def incr(key: String): Future[Long] = {
@@ -235,16 +225,14 @@ class CouchbaseRedisLike(env: Env, logger: Logger, actorSystem: ActorSystem) ext
   override def keys(pattern: String): Future[Seq[String]] = measure("couchbase.ops.keys") {
     val processed = pattern.replace("*", ".*")
     cluster.query(s"""select `key` from ${schemaDotTable} where REGEXP_CONTAINS(`key`, "${processed}");""").map { qr =>
-      qr.rowsAs[JsonObjectSafe].getOrElse(Seq.empty).flatMap(_.str("key").toOption)
+      qr.rowsAs[JsonObjectSafe].map(_.toSeq).getOrElse(Seq.empty).flatMap(_.str("key").toOption)
     }
   }
 
   override def hdel(key: String, fields: String*): Future[Long] = measure("couchbase.ops.hdel") {
     collection.mutateIn(key, fields.map { field =>
       MutateInSpec.remove(s"hvalue.${field}")
-    }).map { res =>
-      fields.size
-    }
+    }).map(_ => fields.size.toLong)
   }
 
   override def hgetall(key: String): Future[Map[String, ByteString]] = measure("couchbase.ops.hgetall") {
@@ -252,7 +240,7 @@ class CouchbaseRedisLike(env: Env, logger: Logger, actorSystem: ActorSystem) ext
       result.contentAs[JsonObjectSafe].toOption.flatMap { doc =>
         doc.obj("hvalue").toOption.map { hash =>
           hash.toMap.collect {
-            case (key, str: String) => (key, str.byteString)
+            case (field, str: String) => (field, str.byteString)
           }.toMap
         }
       }
@@ -264,21 +252,24 @@ class CouchbaseRedisLike(env: Env, logger: Logger, actorSystem: ActorSystem) ext
   }
 
   private def insertAndExists(key: String, doc: JsonObject, timeout: FiniteDuration): Future[Unit] = {
-    implicit val ec = env.otoroshiExecutionContext
-    implicit val mat = env.otoroshiMaterializer
+    given ec: ExecutionContext = env.otoroshiExecutionContext
+    given mat: Materializer = env.otoroshiMaterializer
     val start = System.currentTimeMillis()
-    Source
-      .tick(0.milliseconds, 50.milliseconds, ())
-      .mapAsync(1) { _ =>
-        collection.exists(key)
+    innerInsert(key, doc)
+      .flatMap { _ =>
+        Source
+          .tick(0.milliseconds, 50.milliseconds, ())
+          .mapAsync(1) { _ =>
+            collection.exists(key)
+          }
+          .takeWhile(!_.exists)
+          .completionTimeout(timeout)
+          .runWith(Sink.ignore)
       }
-      .takeWhile(!_.exists)
-      .completionTimeout(timeout)
-      .run()
+      .map(_ => ())
       .recover {
         case e => logger.error("error while check insertion", e)
       }
-      .map(_ => ())
       .andThen {
         case _ => {
           val elapsed = System.currentTimeMillis() - start
@@ -304,7 +295,7 @@ class CouchbaseRedisLike(env: Env, logger: Logger, actorSystem: ActorSystem) ext
     innerGet(key) { res =>
       res.contentAs[JsonObjectSafe].toOption.map { doc =>
         doc.arr("lvalue") match {
-          case Failure(exception) => 0
+          case Failure(_) => 0
           case Success(arr) => arr.size
         }
       }
@@ -312,21 +303,21 @@ class CouchbaseRedisLike(env: Env, logger: Logger, actorSystem: ActorSystem) ext
   }
 
   override def lpush(key: String, values: String*): Future[Long] = {
-    lpushBS(key, values.map(_.byteString):_*)
+    lpushBS(key, values.map(_.byteString)*)
   }
 
   override def lpushLong(key: String, values: Long*): Future[Long] = {
-    lpushBS(key, values.map(_.toString.byteString):_*)
+    lpushBS(key, values.map(_.toString.byteString)*)
   }
 
   override def lpushBS(key: String, values: ByteString*): Future[Long] = measure("couchbase.ops.lpush") {
     for {
       _ <- insertAndExists(key, createDoc(key, "list"), insertAndExistsTimeout)
       _ <- collection.mutateIn(key, Seq(
-        MutateInSpec.arrayPrepend(s"lvalue", values.map(_.utf8String))
+        MutateInSpec.arrayPrepend("lvalue", values.map(_.utf8String))
       ))
     } yield {
-      values.size
+      values.size.toLong
     }
   }
 
@@ -334,7 +325,7 @@ class CouchbaseRedisLike(env: Env, logger: Logger, actorSystem: ActorSystem) ext
     innerGet(key) { res =>
       res.contentAs[JsonObjectSafe].toOption.map { doc =>
         doc.arr("lvalue") match {
-          case Failure(e) => Seq.empty
+          case Failure(_) => Seq.empty
           case Success(arr) =>
             arr.toSeq.slice(start.toInt, stop.toInt - start.toInt).map(_.asInstanceOf[String].byteString)
         }
@@ -348,7 +339,7 @@ class CouchbaseRedisLike(env: Env, logger: Logger, actorSystem: ActorSystem) ext
       all <- lrange(key, 0, 10000L) // lol
       newAll = all.map(_.utf8String).slice(start.toInt, stop.toInt - start.toInt)
       _ <- collection.mutateIn(key, Seq(
-       MutateInSpec.upsert(s"lvalue", JsonArray.fromSeq(newAll))
+       MutateInSpec.upsert("lvalue", JsonArray.fromSeq(newAll))
       ))
     } yield {
       true
@@ -390,21 +381,21 @@ class CouchbaseRedisLike(env: Env, logger: Logger, actorSystem: ActorSystem) ext
       MutateInSpec.upsert("ttl", milliseconds),
       MutateInSpec.upsert("at", System.currentTimeMillis()),
       MutateInSpec.upsert("expired_at", System.currentTimeMillis() + milliseconds)
-    ), MutateInOptions().copy(expiry = milliseconds.millis)).map(_ => true)
+    ), MutateInOptions().expiry(milliseconds.millis)).map(_ => true)
   }
 
   override def sadd(key: String, members: String*): Future[Long] = {
-    saddBS(key, members.map(_.byteString):_*)
+    saddBS(key, members.map(_.byteString)*)
   }
 
   override def saddBS(key: String, members: ByteString*): Future[Long] = measure("couchbase.ops.sadd") {
     for {
       _ <- insertAndExists(key, createDoc(key, "set"), insertAndExistsTimeout)
       _ <- collection.mutateIn(key, members.map(_.utf8String).map { member =>
-        MutateInSpec.arrayAddUnique(s"lvalue", member)
+        MutateInSpec.arrayAddUnique("svalue", member)
       })
     } yield {
-      members.size
+      members.size.toLong
     }
   }
 
@@ -420,7 +411,7 @@ class CouchbaseRedisLike(env: Env, logger: Logger, actorSystem: ActorSystem) ext
     innerGet(key) { res =>
       res.contentAs[JsonObjectSafe].toOption.map { doc =>
         doc.arr("svalue") match {
-          case Failure(e) => Seq.empty
+          case Failure(_) => Seq.empty
           case Success(arr) => arr.toSeq.map(_.asInstanceOf[String].byteString).distinct
         }
       }
@@ -428,19 +419,19 @@ class CouchbaseRedisLike(env: Env, logger: Logger, actorSystem: ActorSystem) ext
   }
 
   override def srem(key: String, members: String*): Future[Long] = {
-    sremBS(key, members.map(_.byteString):_*)
+    sremBS(key, members.map(_.byteString)*)
   }
 
   override def sremBS(key: String, members: ByteString*): Future[Long] = measure("couchbase.ops.srem") {
     for {
       arr <- smembers(key)
       jarr = arr.filterNot(bs => members.contains(bs)).map(_.utf8String)
-      _ <- collection.mutateIn(key, Seq(MutateInSpec.replace(key, JsonArray.fromSeq(jarr))))
-    } yield members.size
+      _ <- collection.mutateIn(key, Seq(MutateInSpec.replace("svalue", JsonArray.fromSeq(jarr))))
+    } yield members.size.toLong
   }
 
   override def scard(key: String): Future[Long] = measure("couchbase.ops.scard") {
-    smembers(key).map(seq => seq.size)
+    smembers(key).map(seq => seq.size.toLong)
   }
 }
 
